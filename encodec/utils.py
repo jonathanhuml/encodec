@@ -11,7 +11,6 @@ from pathlib import Path
 import typing as tp
 
 import torch
-import torchaudio
 
 
 def _linear_overlap_add(frames: tp.List[torch.Tensor], stride: int):
@@ -88,12 +87,14 @@ def convert_audio(wav: torch.Tensor, sr: int, target_sr: int, target_channels: i
         wav = wav.expand(target_channels, -1)
     else:
         raise RuntimeError(f"Impossible to convert from {channels} to {target_channels}")
+    import torchaudio
     wav = torchaudio.transforms.Resample(sr, target_sr)(wav)
     return wav
 
 
 def save_audio(wav: torch.Tensor, path: tp.Union[Path, str],
                sample_rate: int, rescale: bool = False):
+    import torchaudio
     limit = 0.99
     mx = wav.abs().max()
     if rescale:

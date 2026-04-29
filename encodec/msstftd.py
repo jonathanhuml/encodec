@@ -8,12 +8,33 @@
 
 import typing as tp
 
-import torchaudio
 import torch
 from torch import nn
 from einops import rearrange
 
 from .modules import NormConv2d
+
+
+class _Spectrogram(nn.Module):
+    """torch.stft-based replacement for torchaudio.transforms.Spectrogram(power=None)."""
+    def __init__(self, n_fft: int, hop_length: int, win_length: int, normalized: bool):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.normalized = normalized
+        self.register_buffer('window', torch.hann_window(win_length))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T] — process each (B,C) independently
+        B, C, T = x.shape
+        flat = x.reshape(B * C, T)
+        spec = torch.stft(
+            flat, self.n_fft, self.hop_length, self.win_length,
+            window=self.window, normalized=self.normalized,
+            center=False, return_complex=True,
+        )  # [B*C, F, frames]
+        return spec.reshape(B, C, *spec.shape[1:])  # [B, C, F, frames]
 
 
 FeatureMapType = tp.List[torch.Tensor]
@@ -59,9 +80,7 @@ class DiscriminatorSTFT(nn.Module):
         self.win_length = win_length
         self.normalized = normalized
         self.activation = getattr(torch.nn, activation)(**activation_params)
-        self.spec_transform = torchaudio.transforms.Spectrogram(
-            n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length, window_fn=torch.hann_window,
-            normalized=self.normalized, center=False, pad_mode=None, power=None)
+        self.spec_transform = _Spectrogram(self.n_fft, self.hop_length, self.win_length, self.normalized)
         spec_channels = 2 * self.in_channels
         self.convs = nn.ModuleList()
         self.convs.append(
