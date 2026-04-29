@@ -11,6 +11,9 @@ Loss: MSE reconstruction + VQ commitment loss. No discriminator.
 
 import math
 import os
+import argparse
+import contextlib
+from dataclasses import dataclass
 
 import matplotlib
 matplotlib.use('Agg')
@@ -55,7 +58,7 @@ DISC_MIN_T       = max(DISC_N_FFTS)  # skip disc for sequences shorter than this
 # Model
 # ---------------------------------------------------------------------------
 
-def make_eeg_model() -> EncodecModel:
+def make_eeg_model(kmeans_init: bool = True, kmeans_iters: int = 50) -> EncodecModel:
     """1-channel causal EnCodec tuned for 256 Hz EEG."""
     encoder = SEANetEncoder(
         channels=1,
@@ -77,8 +80,8 @@ def make_eeg_model() -> EncodecModel:
         dimension=128,
         n_q=N_Q,
         bins=1024,
-        kmeans_init=True,
-        kmeans_iters=50,
+        kmeans_init=kmeans_init,
+        kmeans_iters=kmeans_iters,
     )
     model = EncodecModel(
         encoder=encoder,
@@ -129,8 +132,15 @@ class EEGEpochDataset(Dataset):
     def __len__(self) -> int:
         return len(self.epochs)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         x = self.epochs[idx]  # [C, T]
+        raw_length = x.shape[-1]
+
+        # per-channel z-score so every electrode is on the same scale. Do this
+        # before padding so synthetic tail samples cannot shift the real signal.
+        mu = x.mean(dim=-1, keepdim=True)
+        sigma = x.std(dim=-1, keepdim=True).clamp(min=1e-8)
+        x = (x - mu) / sigma
 
         # pad T to a multiple of the encoder's total stride
         T = x.shape[-1]
@@ -138,10 +148,7 @@ class EEGEpochDataset(Dataset):
         if rem:
             x = F.pad(x, (0, TOTAL_STRIDE - rem))
 
-        # per-channel z-score so every electrode is on the same scale
-        mu = x.mean(dim=-1, keepdim=True)
-        sigma = x.std(dim=-1, keepdim=True).clamp(min=1e-8)
-        return (x - mu) / sigma  # [C, T_padded]
+        return x, raw_length  # [C, T_padded], raw T
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +159,16 @@ N_TRACE_CHANNELS = 6   # channels to show in time-trace plot
 VIS_DIR = 'vis'
 
 
-def visualize(model: EncodecModel, x: torch.Tensor, epoch: int) -> None:
+def resolve_data_dir(data_dir: str) -> str:
+    if os.path.isdir(data_dir):
+        return data_dir
+    local_data_dir = os.path.expanduser('~/pt3d_varying_length')
+    if data_dir == DATA_DIR and os.path.isdir(local_data_dir):
+        return local_data_dir
+    return data_dir
+
+
+def visualize(model: EncodecModel, x: torch.Tensor, epoch: int, raw_length: int | None = None) -> None:
     """
     x: [C, T] on device (already z-scored).
     Saves two figures per call:
@@ -162,11 +178,15 @@ def visualize(model: EncodecModel, x: torch.Tensor, epoch: int) -> None:
     os.makedirs(VIS_DIR, exist_ok=True)
     model.eval()
     with torch.no_grad():
-        recon, loss_recon, _, _codes = forward_eeg(model, x)
+        recon, loss_recon, _, _codes = forward_eeg(model, x, raw_length=raw_length)
     model.train()
 
-    orig = x.cpu().numpy()       # [C, T]
-    rec  = recon.cpu().numpy()   # [C, T]
+    if raw_length is not None:
+        x = x[..., :raw_length]
+        recon = recon[..., :raw_length]
+
+    orig = x.cpu().numpy()       # [C, T_raw]
+    rec  = recon.cpu().numpy()   # [C, T_raw]
     C, T = orig.shape
     t = np.arange(T) / SAMPLE_RATE
 
@@ -210,7 +230,7 @@ def visualize(model: EncodecModel, x: torch.Tensor, epoch: int) -> None:
 # Training
 # ---------------------------------------------------------------------------
 
-def forward_eeg(model: EncodecModel, x: torch.Tensor):
+def forward_eeg(model: EncodecModel, x: torch.Tensor, raw_length: int | None = None):
     """
     x: [C, T] — one epoch on device.
     Returns (recon [C, T], loss_recon, loss_commit, codes [n_q, C, T_frames]).
@@ -222,9 +242,146 @@ def forward_eeg(model: EncodecModel, x: torch.Tensor):
     qres = model.quantizer(z, model.frame_rate, model.bandwidth)
     recon = model.decoder(qres.quantized)                      # [C, 1, T]
 
-    loss_recon = F.mse_loss(recon, x_flat)
+    if raw_length is None:
+        loss_recon = F.mse_loss(recon, x_flat)
+    else:
+        loss_recon = F.mse_loss(recon[..., :raw_length], x_flat[..., :raw_length])
     loss_commit = qres.penalty
     return recon.squeeze(1), loss_recon, loss_commit, qres.codes
+
+
+# ---------------------------------------------------------------------------
+# Dummy architecture inspection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LayerTrace:
+    name: str
+    module: str
+    input_shape: tuple[int, ...] | str
+    output_shape: tuple[int, ...] | str
+
+
+def _shape(value):
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    if isinstance(value, (tuple, list)):
+        return [_shape(item) for item in value]
+    if hasattr(value, 'quantized') and hasattr(value, 'codes'):
+        return {
+            'quantized': tuple(value.quantized.shape),
+            'codes': tuple(value.codes.shape),
+            'bandwidth': tuple(value.bandwidth.shape),
+            'penalty': tuple(value.penalty.shape) if isinstance(value.penalty, torch.Tensor) else value.penalty,
+        }
+    return type(value).__name__
+
+
+@contextlib.contextmanager
+def trace_eeg_layers(model: EncodecModel):
+    """Collect layer-level input/output shapes for the EEG forward path."""
+    traces: list[LayerTrace] = []
+    handles = []
+
+    def add_hook(name: str):
+        def hook(module, inputs, output):
+            input_value = inputs[0] if len(inputs) == 1 else inputs
+            traces.append(
+                LayerTrace(
+                    name=name,
+                    module=module.__class__.__name__,
+                    input_shape=_shape(input_value),
+                    output_shape=_shape(output),
+                )
+            )
+        return hook
+
+    for prefix, seq in (('encoder', model.encoder.model), ('decoder', model.decoder.model)):
+        for idx, module in enumerate(seq):
+            handles.append(module.register_forward_hook(add_hook(f'{prefix}.{idx:02d}')))
+    for idx, module in enumerate(model.quantizer.vq.layers):
+        handles.append(module.register_forward_hook(add_hook(f'quantizer.{idx:02d}')))
+    handles.append(model.quantizer.register_forward_hook(add_hook('quantizer.rvq')))
+
+    try:
+        yield traces
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def make_dummy_eeg_epoch(channels: int = 32, length: int = 768, seed: int = 0) -> torch.Tensor:
+    """
+    Create one z-scored EEG-like epoch with shape [C, T].
+
+    The signal mixes low-frequency drift, theta/alpha/beta components, channel-specific
+    phase/amplitude, and noise. Length is padded to the model stride just like the dataset.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    t = torch.arange(length, dtype=torch.float32) / SAMPLE_RATE
+    base_freqs = torch.tensor([1.5, 6.0, 10.0, 22.0], dtype=torch.float32)
+    epoch = []
+
+    for channel in range(channels):
+        amps = torch.rand(len(base_freqs), generator=generator) * torch.tensor([0.4, 0.7, 1.0, 0.3])
+        phases = torch.rand(len(base_freqs), generator=generator) * (2 * math.pi)
+        signal = sum(
+            amps[i] * torch.sin(2 * math.pi * base_freqs[i] * t + phases[i])
+            for i in range(len(base_freqs))
+        )
+        slow_drift = 0.15 * torch.sin(2 * math.pi * (0.15 + 0.02 * channel) * t)
+        noise = 0.08 * torch.randn(length, generator=generator)
+        epoch.append(signal + slow_drift + noise)
+
+    x = torch.stack(epoch, dim=0)
+    mu = x.mean(dim=-1, keepdim=True)
+    sigma = x.std(dim=-1, keepdim=True).clamp(min=1e-8)
+    x = (x - mu) / sigma
+    rem = x.shape[-1] % TOTAL_STRIDE
+    if rem:
+        x = F.pad(x, (0, TOTAL_STRIDE - rem))
+    return x
+
+
+def _format_shape(value) -> str:
+    if isinstance(value, tuple):
+        return '[' + ', '.join(str(v) for v in value) + ']'
+    if isinstance(value, list):
+        return '[' + ', '.join(_format_shape(v) for v in value) + ']'
+    if isinstance(value, dict):
+        return '{' + ', '.join(f'{key}: {_format_shape(val)}' for key, val in value.items()) + '}'
+    return str(value)
+
+
+def run_dummy_arch_check(channels: int, length: int, seed: int) -> None:
+    device = torch.device(DEVICE)
+    model = make_eeg_model(kmeans_init=False).to(device)
+    model.eval()
+    x = make_dummy_eeg_epoch(channels=channels, length=length, seed=seed).to(device)
+
+    with torch.no_grad(), trace_eeg_layers(model) as traces:
+        recon, loss_recon, loss_commit, codes = forward_eeg(model, x)
+
+    print('dummy EEG architecture check')
+    print(f'input epoch:              {list(x.shape)}  [channels, time]')
+    print(f'per-channel model input:  {[x.shape[0], 1, x.shape[1]]}  [batch=C, 1, time]')
+    print(f'sample_rate={SAMPLE_RATE} Hz | total_stride={TOTAL_STRIDE} | frame_rate={model.frame_rate} fps')
+    print(f'bandwidth={model.bandwidth:.4f} kbps | n_q={N_Q} | bins={model.quantizer.bins}')
+    print('')
+    print(f'{"stage":<18} {"module":<24} {"input":<24} output')
+    print('-' * 96)
+    for trace in traces:
+        print(
+            f'{trace.name:<18} '
+            f'{trace.module:<24} '
+            f'{_format_shape(trace.input_shape):<24} '
+            f'{_format_shape(trace.output_shape)}'
+        )
+    print('-' * 96)
+    print(f'codes:                    {list(codes.shape)}  [n_q, channels, frames]')
+    print(f'reconstruction:           {list(recon.shape)}  [channels, time]')
+    print(f'reconstruction MSE:       {loss_recon.item():.6f}')
+    print(f'commitment loss:          {loss_commit.item():.6f}')
 
 
 def train(
@@ -246,7 +403,8 @@ def train(
     optimizer_g = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.5, 0.9))
     optimizer_d = torch.optim.Adam(disc.parameters(), lr=lr * 3, betas=(0.5, 0.9)) if disc else None
 
-    probe = dataset[0].to(DEVICE)
+    probe, probe_raw_length = dataset[0]
+    probe = probe.to(DEVICE)
 
     model.train()
     if disc is not None:
@@ -257,15 +415,17 @@ def train(
         total_recon = total_commit = total_adv = total_fm = total_d = 0.0
         code_counts = torch.zeros(N_Q, 1024)
 
-        for x in loader:
+        for x, raw_length in loader:
             x = x.to(DEVICE)
-            recon, loss_recon, loss_commit, codes = forward_eeg(model, x)
+            recon, loss_recon, loss_commit, codes = forward_eeg(model, x, raw_length=raw_length)
 
-            x_d = x.unsqueeze(1)      # [C, 1, T]
-            r_d = recon.unsqueeze(1)  # [C, 1, T]
+            x_real = x[..., :raw_length]
+            recon_real = recon[..., :raw_length]
+            x_d = x_real.unsqueeze(1)      # [C, 1, T_raw]
+            r_d = recon_real.unsqueeze(1)  # [C, 1, T_raw]
 
             # --- generator step ---
-            if use_disc and x.shape[-1] >= DISC_MIN_T:
+            if use_disc and raw_length >= DISC_MIN_T:
                 logits_real, fmaps_real = disc(x_d.detach())
                 logits_fake, fmaps_fake = disc(r_d)
 
@@ -287,7 +447,7 @@ def train(
             optimizer_g.step()
 
             # --- discriminator step ---
-            if use_disc and x.shape[-1] >= DISC_MIN_T:
+            if use_disc and raw_length >= DISC_MIN_T:
                 logits_real, _ = disc(x_d.detach())
                 logits_fake, _ = disc(r_d.detach())
 
@@ -329,7 +489,7 @@ def train(
             )
 
         if epoch % vis_every == 0:
-            visualize(model, probe, epoch)
+            visualize(model, probe, epoch, raw_length=probe_raw_length)
             print(f'  -> saved vis/epoch_{epoch:04d}_{{traces,psd}}.png')
 
 
@@ -337,22 +497,81 @@ def train(
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
-    # Overfit on a tiny slice: first 2 files = ~128 epochs
-    dataset = EEGEpochDataset(DATA_DIR, max_files=2)
-    print(f'{len(dataset)} epochs loaded from {DATA_DIR}')
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Train or inspect the EEG Encodec path.')
+    parser.add_argument(
+        '--dummy-arch-check',
+        action='store_true',
+        help='Run one synthetic EEG epoch through encoder, RVQ, and decoder, then print layer shapes.',
+    )
+    parser.add_argument('--dummy-channels', type=int, default=32)
+    parser.add_argument('--dummy-length', type=int, default=768)
+    parser.add_argument('--dummy-seed', type=int, default=0)
+    parser.add_argument('--data-dir', default=DATA_DIR)
+    parser.add_argument('--max-files', type=int, default=2)
+    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--disc-warmup', type=int, default=50)
+    parser.add_argument('--log-every', type=int, default=10)
+    parser.add_argument('--vis-every', type=int, default=50)
+    parser.add_argument('--no-disc', action='store_true')
+    parser.add_argument('--no-kmeans-init', action='store_true')
+    parser.add_argument('--checkpoint', default='eeg_overfit.pt')
+    args = parser.parse_args()
 
-    model = make_eeg_model().to(DEVICE)
-    disc  = make_eeg_discriminator().to(DEVICE)
+    if args.dummy_arch_check:
+        run_dummy_arch_check(
+            channels=args.dummy_channels,
+            length=args.dummy_length,
+            seed=args.dummy_seed,
+        )
+        return
+
+    # Overfit on a tiny slice: first 2 files = ~128 epochs
+    data_dir = resolve_data_dir(args.data_dir)
+    dataset = EEGEpochDataset(data_dir, max_files=args.max_files)
+    print(f'{len(dataset)} epochs loaded from {data_dir}')
+
+    model = make_eeg_model(kmeans_init=not args.no_kmeans_init).to(DEVICE)
+    disc = None if args.no_disc else make_eeg_discriminator().to(DEVICE)
+    disc_params = sum(p.numel() for p in disc.parameters()) if disc is not None else 0
     print(
         f'generator {sum(p.numel() for p in model.parameters()):,} params | '
-        f'discriminator {sum(p.numel() for p in disc.parameters()):,} params'
+        f'discriminator {disc_params:,} params'
     )
     print(
         f'frame_rate={model.frame_rate} fps | '
         f'bandwidth={model.bandwidth:.4f} kbps | '
         f'n_q={N_Q} codebooks | '
-        f'disc warmup=50 epochs'
+        f'disc warmup={args.disc_warmup} epochs'
     )
 
-    train(model, dataset, disc=disc)
+    train(
+        model,
+        dataset,
+        disc=disc,
+        n_epochs=args.epochs,
+        lr=args.lr,
+        disc_warmup=args.disc_warmup,
+        log_every=args.log_every,
+        vis_every=args.vis_every,
+    )
+    if args.checkpoint:
+        torch.save(
+            {
+                'model_state_dict': model.state_dict(),
+                'sample_rate': SAMPLE_RATE,
+                'ratios': RATIOS,
+                'n_q': N_Q,
+                'bandwidth': model.bandwidth,
+                'data_dir': data_dir,
+                'max_files': args.max_files,
+                'epochs': args.epochs,
+            },
+            args.checkpoint,
+        )
+        print(f'saved checkpoint to {args.checkpoint}')
+
+
+if __name__ == '__main__':
+    main()
